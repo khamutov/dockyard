@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/khamutov/dockyard/main/assets/dockyard-logo.svg" style="max-height:100%;" height="175">
+</p>
+
 # Dockyard
 
 A monorepo management tool for vendoring and maintaining third-party dependencies.
