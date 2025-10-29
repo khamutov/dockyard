@@ -13,6 +13,27 @@ Dockyard simplifies the process of integrating external Git repositories into yo
 - **Metadata Tracking**: Automatically track dependency URLs, versions, and commit hashes
 - **Monorepo Integration**: Uses canonical path format (`//third_party/name`) for consistent organization
 
+## Installation
+
+Install Dockyard directly from the Git repository using Cargo:
+
+```bash
+cargo install --git https://github.com/khamutov/dockyard.git
+```
+
+This will build and install the `dockyard` binary to your Cargo bin directory (typically `~/.cargo/bin/`).
+
+### Local Development
+
+For development or testing without installing globally, you can also run directly from the source:
+
+```bash
+git clone https://github.com/khamutov/dockyard.git
+cd dockyard
+cargo build --release
+# Run using: cargo run -- <command> <args>
+```
+
 ## Vendored Code Structure
 
 ```
@@ -30,7 +51,7 @@ third_party/
 Import an external Git repository into your monorepo:
 
 ```bash
-cargo run vendor --git https://github.com/example/repo.git --path //third_party/example
+dockyard vendor --git https://github.com/example/repo.git --path //third_party/example
 ```
 
 This will:
@@ -45,7 +66,7 @@ You need to commit code AS-IS after that operation.
 After making changes to vendored code, extract them as patches:
 
 ```bash
-cargo run extract-patch --path //third_party/example
+dockyard extract-patch --path //third_party/example
 ```
 
 This generates numbered patch files in `third_party/example/patches/` that must be added to git alongside your changes.
