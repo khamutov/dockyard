@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/khamutov/dockyard/refs/heads/main/assets/dockyard.svg" style="max-height:100%;" height="175">
+  <img src="https://raw.githubusercontent.com/khamutov/dockyard/refs/heads/main/assets/dockyard.svg" style="max-height:100px;" height="100">
 </p>
 
 # Dockyard
