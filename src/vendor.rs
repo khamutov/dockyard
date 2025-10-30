@@ -119,13 +119,11 @@ pub fn extract_patch(args: ExtractPatchCommandArgs, paths: &paths::MonorepoPaths
 fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<u8>> {
     let relative_path = repo_dir.strip_prefix(&paths.root)?;
 
+    let repo_dir = repo_dir.to_string_lossy().replace('\\', "/");
+    let relative_path = relative_path.to_string_lossy().replace('\\', "/");
+
     let ls = Command::new("git")
-        .args([
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            repo_dir.to_str().unwrap(),
-        ])
+        .args(["ls-files", "--others", "--exclude-standard", &repo_dir])
         .output()?;
     if !ls.status.success() {
         bail!(
@@ -136,10 +134,7 @@ fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<
     }
 
     if !ls.stdout.is_empty() {
-        return Err(anyhow!(
-            "untracked files exist under {}",
-            repo_dir.display()
-        ));
+        return Err(anyhow!("untracked files exist under {}", &repo_dir));
     }
 
     let patch_cmd = Command::new("git")
@@ -147,9 +142,9 @@ fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<
             "diff".to_string(),
             // include all files (from index and unstaged)
             "HEAD".to_string(),
-            format!("--relative={}", relative_path.display()),
+            format!("--relative={}", &relative_path),
             "--".to_string(),
-            repo_dir.display().to_string(),
+            repo_dir.clone(),
         ])
         .output()?;
 
@@ -158,10 +153,7 @@ fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<
     }
 
     if patch_cmd.stdout.is_empty() {
-        return Err(anyhow!(
-            "no changes detected in third_party: {}",
-            repo_dir.display(),
-        ));
+        return Err(anyhow!("no changes detected in third_party: {}", repo_dir));
     }
 
     Ok(patch_cmd.stdout)
@@ -201,7 +193,11 @@ mod tests {
             .args(["add", target_dir.to_str().unwrap()])
             .output()?;
         if !add_file_to_git.status.success() {
-            bail!("git add failed");
+            bail!(
+                "git add faile, stdout: {}, stderr: {}",
+                String::from_utf8_lossy(&add_file_to_git.stdout),
+                String::from_utf8_lossy(&add_file_to_git.stderr),
+            );
         }
 
         let diff = extract_diff(&target_dir, &paths)?;
@@ -227,7 +223,11 @@ index 0000000..c0d0fb4
             ])
             .output()?;
         if !remove_files_from_git.status.success() {
-            bail!("git restore staged file failed");
+            bail!(
+                "git restore staged file failed, stdout: {}, stderr: {}",
+                String::from_utf8_lossy(&remove_files_from_git.stdout),
+                String::from_utf8_lossy(&remove_files_from_git.stderr),
+            );
         }
         fs::remove_dir_all(target_dir)?;
 
@@ -253,8 +253,9 @@ index 0000000..c0d0fb4
             .output()?;
         if !add_file_to_git.status.success() {
             bail!(
-                "git add failed: {}",
-                String::from_utf8_lossy(&add_file_to_git.stderr)
+                "git add faile, stdout: {}, stderr: {}",
+                String::from_utf8_lossy(&add_file_to_git.stdout),
+                String::from_utf8_lossy(&add_file_to_git.stderr),
             );
         }
 
@@ -277,11 +278,15 @@ index 0000000..c0d0fb4
             .args([
                 "restore",
                 "--staged",
-                target_dir.join("tesfile.txt").to_str().unwrap(),
+                repo_dir.join("tesfile.txt").to_str().unwrap(),
             ])
             .output()?;
         if !remove_files_from_git.status.success() {
-            bail!("git restore staged file failed");
+            bail!(
+                "git restore staged file failed, stdout: {}, stderr: {}",
+                String::from_utf8_lossy(&remove_files_from_git.stdout),
+                String::from_utf8_lossy(&remove_files_from_git.stderr),
+            );
         }
         fs::remove_dir_all(target_dir)?;
 
