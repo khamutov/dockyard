@@ -10,6 +10,7 @@ use crate::UpdateCommandArgs;
 use crate::VendorCommandArgs;
 use crate::paths;
 use anyhow::Context;
+use anyhow::bail;
 use anyhow::{Result, anyhow};
 use dockyard::paths::path_to_abs;
 use dockyard::utils::run_command;
@@ -127,7 +128,11 @@ fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<
         ])
         .output()?;
     if !ls.status.success() {
-        return Err(anyhow!("git ls-files failed"));
+        bail!(
+            "git ls-files failed, stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&ls.stdout),
+            String::from_utf8_lossy(&ls.stderr),
+        );
     }
 
     if !ls.stdout.is_empty() {
@@ -164,15 +169,27 @@ fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process::Command};
+    use std::{
+        fs,
+        process::Command,
+        sync::{Mutex, OnceLock},
+    };
 
     use anyhow::{Context, bail};
     use dockyard::{paths::path_to_abs, *};
 
     use crate::vendor::extract_diff;
 
+    static GIT_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_lock() -> &'static Mutex<()> {
+        GIT_TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn test_extract_patch() -> anyhow::Result<()> {
+        let _guard = test_lock().lock().unwrap();
+
         let paths = paths::MonorepoPaths::from_third_party_dir("test_dir")
             .context("Could not find monorepo checkout paths")?;
         let target_dir = path_to_abs(&paths, "//test_dir/repo_extract")?;
@@ -218,7 +235,63 @@ index 0000000..c0d0fb4
     }
 
     #[test]
+    fn test_extract_patch_with_repo_subdir() -> anyhow::Result<()> {
+        // Git expects forward slashes ('/') as the path separator. So let's check that the
+        // functions works properly with possible backslashes after PahtBuf::join as well.
+        let _guard = test_lock().lock().unwrap();
+
+        let paths = paths::MonorepoPaths::from_third_party_dir("test_dir")
+            .context("Could not find monorepo checkout paths")?;
+        let target_dir = path_to_abs(&paths, "//test_dir/repo_extract_backslash")?;
+        let repo_dir = target_dir.join("repo");
+        fs::create_dir_all(&repo_dir)?;
+
+        fs::write(repo_dir.join("tesfile.txt"), "line1\nline2\n")?;
+
+        let add_file_to_git = Command::new("git")
+            .args(["add", target_dir.to_str().unwrap()])
+            .output()?;
+        if !add_file_to_git.status.success() {
+            bail!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&add_file_to_git.stderr)
+            );
+        }
+
+        let diff = extract_diff(&repo_dir, &paths)?;
+
+        let diff_str = String::from_utf8_lossy(&diff);
+
+        let expected_diff = "diff --git a/tesfile.txt b/tesfile.txt
+new file mode 100644
+index 0000000..c0d0fb4
+--- /dev/null
++++ b/tesfile.txt
+@@ -0,0 +1,2 @@
++line1
++line2
+";
+        assert_eq!(diff_str, expected_diff);
+
+        let remove_files_from_git = Command::new("git")
+            .args([
+                "restore",
+                "--staged",
+                target_dir.join("tesfile.txt").to_str().unwrap(),
+            ])
+            .output()?;
+        if !remove_files_from_git.status.success() {
+            bail!("git restore staged file failed");
+        }
+        fs::remove_dir_all(target_dir)?;
+
+        Ok(())
+    }
+
+    #[test]
     fn test_extract_patch_error_on_untracked() -> anyhow::Result<()> {
+        let _guard = test_lock().lock().unwrap();
+
         let paths = paths::MonorepoPaths::from_third_party_dir("test_dir")
             .context("Could not find monorepo checkout paths")?;
         let target_dir = path_to_abs(&paths, "//test_dir/repo_untracked")?;
