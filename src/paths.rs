@@ -24,6 +24,17 @@ impl MonorepoPaths {
             third_party: check_path(&root_dir, THIRD_PARTY_DIR)?,
         })
     }
+
+    /// Create the `MonorepoPath` resolver with custom 3rd party path. Accesses the filesystem to
+    /// get the checkout root.
+    pub fn from_third_party_dir(third_party_path: &str) -> io::Result<MonorepoPaths> {
+        let root_dir = find_repo_root()?;
+
+        Ok(MonorepoPaths {
+            root: root_dir.clone(),
+            third_party: check_path(&root_dir, third_party_path)?,
+        })
+    }
 }
 
 fn check_path(root: &Path, p_str: &str) -> io::Result<PathBuf> {

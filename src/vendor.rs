@@ -1,6 +1,8 @@
 use std::fs;
 use std::fs::File;
 use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 use crate::ExtractPatchCommandArgs;
@@ -86,7 +88,55 @@ pub fn extract_patch(args: ExtractPatchCommandArgs, paths: &paths::MonorepoPaths
         fs::create_dir_all(&patches_dir)?;
     }
 
+    let diff = extract_diff(&repo_dir, paths)?;
+
+    // Determine patch number
+    let mut max_n = 0;
+    for entry in fs::read_dir(&patches_dir)? {
+        let entry = entry?;
+        let fname = entry.file_name().into_string().unwrap();
+        if let Some(n_str) = fname.split('-').next() {
+            if let Ok(n) = n_str.parse::<u32>() {
+                if n > max_n {
+                    max_n = n;
+                }
+            }
+        }
+    }
+    let patch_number = format!("{:04}", max_n + 1);
+    let patch_name = format!("{patch_number}-change_name.patch");
+    let patch_path = patches_dir.join(patch_name);
+
+    let mut file = File::create(&patch_path)?;
+    file.write_all(&diff)?;
+
+    println!("Patch written to: {}", patch_path.display());
+
+    Ok(())
+}
+
+fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<u8>> {
     let relative_path = repo_dir.strip_prefix(&paths.root)?;
+
+    let ls = Command::new("git")
+        .args([
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            repo_dir.to_str().unwrap(),
+        ])
+        .output()?;
+    if !ls.status.success() {
+        return Err(anyhow!("git ls-files failed"));
+    }
+
+    if !ls.stdout.is_empty() {
+        return Err(anyhow!(
+            "untracked files exist under {}",
+            repo_dir.display()
+        ));
+    }
+
     let patch_cmd = Command::new("git")
         .args([
             "diff".to_string(),
@@ -109,27 +159,78 @@ pub fn extract_patch(args: ExtractPatchCommandArgs, paths: &paths::MonorepoPaths
         ));
     }
 
-    // Determine patch number
-    let mut max_n = 0;
-    for entry in fs::read_dir(&patches_dir)? {
-        let entry = entry?;
-        let fname = entry.file_name().into_string().unwrap();
-        if let Some(n_str) = fname.split('-').next() {
-            if let Ok(n) = n_str.parse::<u32>() {
-                if n > max_n {
-                    max_n = n;
-                }
-            }
+    Ok(patch_cmd.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, process::Command};
+
+    use anyhow::{Context, bail};
+    use dockyard::{paths::path_to_abs, *};
+
+    use crate::vendor::extract_diff;
+
+    #[test]
+    fn test_extract_patch() -> anyhow::Result<()> {
+        let paths = paths::MonorepoPaths::from_third_party_dir("test_dir")
+            .context("Could not find monorepo checkout paths")?;
+        let target_dir = path_to_abs(&paths, "//test_dir/repo_extract")?;
+        fs::create_dir_all(&target_dir)?;
+
+        fs::write(target_dir.join("tesfile.txt"), "line1\nline2\n")?;
+
+        let add_file_to_git = Command::new("git")
+            .args(["add", target_dir.to_str().unwrap()])
+            .output()?;
+        if !add_file_to_git.status.success() {
+            bail!("git add failed");
+        }
+
+        let diff = extract_diff(&target_dir, &paths)?;
+
+        let diff_str = String::from_utf8_lossy(&diff);
+
+        let expected_diff = "diff --git a/tesfile.txt b/tesfile.txt
+new file mode 100644
+index 0000000..c0d0fb4
+--- /dev/null
++++ b/tesfile.txt
+@@ -0,0 +1,2 @@
++line1
++line2
+";
+        assert_eq!(diff_str, expected_diff);
+
+        let remove_files_from_git = Command::new("git")
+            .args([
+                "restore",
+                "--staged",
+                target_dir.join("tesfile.txt").to_str().unwrap(),
+            ])
+            .output()?;
+        if !remove_files_from_git.status.success() {
+            bail!("git restore staged file failed");
+        }
+        fs::remove_dir_all(target_dir)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_patch_error_on_untracked() -> anyhow::Result<()> {
+        let paths = paths::MonorepoPaths::from_third_party_dir("test_dir")
+            .context("Could not find monorepo checkout paths")?;
+        let target_dir = path_to_abs(&paths, "//test_dir/repo_untracked")?;
+        fs::create_dir_all(&target_dir)?;
+
+        fs::write(target_dir.join("tesfile.txt"), "line1\nline2\n")?;
+
+        if let Err(_) = extract_diff(&target_dir, &paths) {
+            fs::remove_dir_all(target_dir)?;
+            Ok(())
+        } else {
+            bail!("expected to produce error with untracked files")
         }
     }
-    let patch_number = format!("{:04}", max_n + 1);
-    let patch_name = format!("{patch_number}-change_name.patch");
-    let patch_path = patches_dir.join(patch_name);
-
-    let mut file = File::create(&patch_path)?;
-    file.write_all(&patch_cmd.stdout)?;
-
-    println!("Patch written to: {}", patch_path.display());
-
-    Ok(())
 }
