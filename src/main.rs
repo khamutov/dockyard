@@ -66,6 +66,13 @@ struct UpdateCommandArgs {
         default_value_t = false
     )]
     status: bool,
+    #[arg(
+        long = "continue",
+        help = " \
+        Show update status.",
+        default_value_t = false
+    )]
+    cont: bool,
     #[arg(help = " \
         Update third party dependency under specified path. \
         The path must be provided in the canonical format: //third_party/dep_name")]

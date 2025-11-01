@@ -13,23 +13,25 @@ use crate::paths;
 use anyhow::Context;
 use anyhow::bail;
 use anyhow::{Result, anyhow};
+use dockyard::paths::MonorepoPaths;
 use dockyard::paths::path_to_abs;
 use dockyard::utils::run_command;
 use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct DependencyMetadata {
     url: String,
     version: String,
     update_state: Option<UpdateState>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 enum PatchState {
     Pending,
     Applied,
     Conflict,
+    Resolved,
 }
 
 impl Display for PatchState {
@@ -38,17 +40,18 @@ impl Display for PatchState {
             PatchState::Pending => write!(f, "Pending"),
             PatchState::Conflict => write!(f, "Conflict"),
             PatchState::Applied => write!(f, "Applied"),
+            PatchState::Resolved => write!(f, "Resolved"),
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct PatchApplyState {
     name: String,
     state: PatchState,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct UpdateState {
     prev_commit_hash: String,
     patches: Vec<PatchApplyState>,
@@ -154,9 +157,9 @@ pub fn get_current_commit() -> Result<String> {
 
 pub fn update(args: UpdateCommandArgs, paths: &paths::MonorepoPaths) -> Result<()> {
     ensure_git_clean()?;
-    let path = &args.path.as_ref().unwrap();
+    let canonical_path = &args.path.as_ref().unwrap();
 
-    let target_dir = path_to_abs(paths, &path)?;
+    let target_dir = path_to_abs(paths, &canonical_path)?;
 
     if !target_dir.exists() {
         bail!("Target not found: {}", target_dir.display());
@@ -174,6 +177,21 @@ pub fn update(args: UpdateCommandArgs, paths: &paths::MonorepoPaths) -> Result<(
             println!("No active update");
         }
 
+        return Ok(());
+    }
+
+    if args.cont {
+        if metadata.update_state.is_none() {
+            bail!("No active update state");
+        }
+        apply_patches(&target_dir, &canonical_path, paths, &mut metadata)?;
+
+        metadata.update_state = None;
+        update_metadata(&target_dir, &metadata)?;
+
+        let commit_msg = format!("Update metadata for {}", &canonical_path);
+        commit_code(&commit_msg)?;
+        println!("All patches were applied");
         return Ok(());
     }
 
@@ -214,13 +232,121 @@ pub fn update(args: UpdateCommandArgs, paths: &paths::MonorepoPaths) -> Result<(
     });
     update_metadata(&target_dir, &metadata)?;
 
-    let commit_message = format!("Update {} to {}", &args.path.unwrap(), version);
+    let commit_message = format!("Update {} to {}", &canonical_path, version);
     commit_code(&commit_message)?;
 
-    unimplemented!("Update is not yet implemented")
+    apply_patches(&target_dir, &canonical_path, paths, &mut metadata)?;
+
+    metadata.update_state = None;
+    update_metadata(&target_dir, &metadata)?;
+
+    let commit_msg = format!("Update metadata for {}", &canonical_path);
+    commit_code(&commit_msg)?;
+    println!("All patches were applied");
+    Ok(())
 }
 
-pub fn commit_code(message: &str) -> Result<()> {
+fn apply_patches(
+    target_dir: &PathBuf,
+    canonical_path: &str,
+    paths: &MonorepoPaths,
+    metadata: &mut DependencyMetadata,
+) -> Result<()> {
+    let mut update_state_mut = metadata.update_state.clone().unwrap();
+
+    if let Some(ref update_state) = metadata.clone().update_state {
+        let patches_count = update_state.patches.len();
+        println!("Applying patches:");
+        for (idx, patch) in update_state.patches.clone().iter().enumerate() {
+            match patch.state {
+                PatchState::Pending => {
+                    match try_apply_patch(target_dir, paths, &patch.name) {
+                        Ok(_) => {
+                            update_state_mut.patches[idx].state = PatchState::Applied;
+                            metadata.update_state = Some(update_state_mut.clone());
+                            update_metadata(target_dir, metadata)?;
+                            let commit_msg = format!(
+                                "Applied patch ({}/{}) {} for {}",
+                                idx, patches_count, patch.name, &canonical_path,
+                            );
+                            commit_code(&commit_msg)?;
+                        }
+                        Err(_) => {
+                            update_state_mut.patches[idx].state = PatchState::Conflict;
+                            metadata.update_state = Some(update_state_mut.clone());
+                            update_metadata(target_dir, metadata)?;
+
+                            print!(
+                                "Patch cannot be applied, fix conflicts and run\n\n:\tdockyard update --continue {}\n",
+                                canonical_path
+                            );
+                            bail!("Failed apply patch");
+                        }
+                    };
+                }
+                PatchState::Applied => {
+                    println!("Skipping already applied patch {}", patch.name);
+                }
+                PatchState::Conflict => {
+                    let repo_dir = target_dir.join("repo");
+                    let diff = extract_diff(&repo_dir, paths)?;
+
+                    let patches_dir = target_dir.join("patches");
+                    let patch_path = patches_dir.join(&patch.name);
+
+                    let mut file = File::create(&patch_path)?;
+                    file.write_all(&diff)?;
+
+                    println!("Patch {} updated", patch_path.display());
+
+                    update_state_mut.patches[idx].state = PatchState::Resolved;
+                    metadata.update_state = Some(update_state_mut.clone());
+                    update_metadata(target_dir, metadata)?;
+                    let commit_msg = format!(
+                        "Resolve conflicted patch ({}/{}) {} for {}",
+                        idx, patches_count, patch.name, &canonical_path,
+                    );
+                    commit_code(&commit_msg)?;
+                }
+                PatchState::Resolved => {
+                    println!("Skipping already applied patch {}", patch.name);
+                }
+            };
+        }
+        Ok(())
+    } else {
+        bail!("No active update");
+    }
+}
+
+fn try_apply_patch(
+    target_dir: &PathBuf,
+    paths: &paths::MonorepoPaths,
+    patch_name: &str,
+) -> Result<()> {
+    let patches_dir = target_dir.join("patches");
+    let repo_dir = target_dir.join("repo");
+    let patch_path = patches_dir.join(&patch_name);
+    let relative_path = repo_dir.strip_prefix(&paths.root)?;
+    let relative_path = relative_path.to_string_lossy().replace('\\', "/");
+
+    let dir_args = format!("--directory={}", &relative_path);
+    let output = Command::new("git")
+        .current_dir(&repo_dir)
+        .args(["apply", "-3", &dir_args, &patch_path.to_string_lossy()])
+        .output()?;
+
+    if output.status.success() {
+        println!("Patch applied successfully");
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        Ok(())
+    } else {
+        eprintln!("Patch failed");
+        bail!("Patch failed {}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+fn commit_code(message: &str) -> Result<()> {
     let commit_cmd = Command::new("git")
         .args(["commit", "-a", "-m", message])
         .output()?;
@@ -236,7 +362,7 @@ pub fn commit_code(message: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn ensure_git_clean() -> Result<()> {
+fn ensure_git_clean() -> Result<()> {
     let git_cmd = Command::new("git")
         .args(["status", "--porcelain"])
         .output()?;
