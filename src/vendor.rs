@@ -256,7 +256,7 @@ fn apply_patches(
 
     if let Some(ref update_state) = metadata.clone().update_state {
         let patches_count = update_state.patches.len();
-        println!("Applying patches:");
+        println!("\nApplying patches:");
         for (idx, patch) in update_state.patches.clone().iter().enumerate() {
             match patch.state {
                 PatchState::Pending => {
@@ -267,9 +267,19 @@ fn apply_patches(
                             update_metadata(target_dir, metadata)?;
                             let commit_msg = format!(
                                 "Applied patch ({}/{}) {} for {}",
-                                idx, patches_count, patch.name, &canonical_path,
+                                idx + 1,
+                                patches_count,
+                                patch.name,
+                                &canonical_path,
                             );
                             commit_code(&commit_msg)?;
+                            println!(
+                                "Successfully applied patch ({}/{}) {} for {}",
+                                idx + 1,
+                                patches_count,
+                                patch.name,
+                                &canonical_path,
+                            );
                         }
                         Err(_) => {
                             update_state_mut.patches[idx].state = PatchState::Conflict;
@@ -337,8 +347,6 @@ fn try_apply_patch(
         .output()?;
 
     if output.status.success() {
-        println!("Patch applied successfully");
-        println!("{}", String::from_utf8_lossy(&output.stdout));
         Ok(())
     } else {
         eprintln!("Patch failed");
