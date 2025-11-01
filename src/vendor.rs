@@ -1,7 +1,8 @@
+use std::fmt::Display;
 use std::fs;
 use std::fs::File;
+use std::io::BufReader;
 use std::io::Write;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -14,25 +15,55 @@ use anyhow::bail;
 use anyhow::{Result, anyhow};
 use dockyard::paths::path_to_abs;
 use dockyard::utils::run_command;
+use serde::Deserialize;
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct DependencyMetadata {
     url: String,
     version: String,
+    update_state: Option<UpdateState>,
 }
+
+#[derive(Serialize, Deserialize)]
+enum PatchState {
+    Pending,
+    Applied,
+    Conflict,
+}
+
+impl Display for PatchState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PatchState::Pending => write!(f, "Pending"),
+            PatchState::Conflict => write!(f, "Conflict"),
+            PatchState::Applied => write!(f, "Applied"),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PatchApplyState {
+    name: String,
+    state: PatchState,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UpdateState {
+    prev_commit_hash: String,
+    patches: Vec<PatchApplyState>,
+}
+
+const DEP_INFO: &str = "dep_info.json";
 
 pub fn vendor(args: VendorCommandArgs, paths: &paths::MonorepoPaths) -> Result<()> {
     let target_dir = path_to_abs(paths, &args.path)?;
 
-    // 1. check target path doesn't exist
     if target_dir.exists() {
         return Err(anyhow!("Target must be empty: {}", target_dir.display()));
     }
-    // 2. create target path
     fs::create_dir_all(&target_dir)?;
 
-    // 3. clone the git repository to `repo` subdir
     let clone_dir = target_dir.join("repo");
     let mut clone_cmd = Command::new("git");
     clone_cmd.args(["clone", &args.git, clone_dir.to_str().unwrap()]);
@@ -58,22 +89,196 @@ pub fn vendor(args: VendorCommandArgs, paths: &paths::MonorepoPaths) -> Result<(
         }
         String::from_utf8(version_cmd.stdout)?.trim().to_string()
     };
-    // 4. remove .git from the cloned repo
     fs::remove_dir_all(clone_dir.join(".git"))?;
 
-    // 5. create metadata file
     let meta = DependencyMetadata {
         url: args.git.to_string(),
         version: version_str.to_string(),
+        update_state: None,
     };
-    let json = serde_json::to_string_pretty(&meta)?;
-    fs::write(target_dir.join("dep_info.json"), json)?;
+    update_metadata(&target_dir, &meta)?;
 
     Ok(())
 }
 
-pub fn update(_args: UpdateCommandArgs, _paths: &paths::MonorepoPaths) -> Result<()> {
+fn update_metadata(target_dir: &PathBuf, metadata: &DependencyMetadata) -> Result<()> {
+    let json = serde_json::to_string_pretty(&metadata)?;
+    fs::write(target_dir.join(DEP_INFO), json)?;
+
+    Ok(())
+}
+
+fn load_metadata(target_dir: &PathBuf) -> Result<DependencyMetadata> {
+    let file = File::open(target_dir.join(DEP_INFO))?;
+    let reader = BufReader::new(file);
+
+    let metadata: DependencyMetadata = serde_json::from_reader(reader)?;
+
+    Ok(metadata)
+}
+
+fn get_update_version(args: &UpdateCommandArgs, metadata: &DependencyMetadata) -> Result<String> {
+    if let Some(ref version) = args.version {
+        Ok(version.clone())
+    } else {
+        let version_cmd = Command::new("git")
+            .args(["ls-remote", &metadata.url, "HEAD"])
+            .output()?;
+        if !version_cmd.status.success() {
+            bail!(
+                "git ls-remote failed, stdout: {}, stderr: {}",
+                String::from_utf8_lossy(&version_cmd.stdout),
+                String::from_utf8_lossy(&version_cmd.stderr),
+            );
+        }
+        let output = String::from_utf8(version_cmd.stdout)?.trim().to_string();
+
+        // git ls-remote shows
+        // commit_hash HEAD
+        let mut iter = output.split_whitespace();
+        if let Some(version) = iter.next() {
+            Ok(version.to_string())
+        } else {
+            bail!("Unexpected git ls-remote output: {}", output);
+        }
+    }
+}
+
+pub fn get_current_commit() -> Result<String> {
+    let version_cmd = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
+    if !version_cmd.status.success() {
+        bail!("git rev-parse failed");
+    }
+    Ok(String::from_utf8(version_cmd.stdout)?.trim().to_string())
+}
+
+pub fn update(args: UpdateCommandArgs, paths: &paths::MonorepoPaths) -> Result<()> {
+    ensure_git_clean()?;
+    let path = &args.path.as_ref().unwrap();
+
+    let target_dir = path_to_abs(paths, &path)?;
+
+    if !target_dir.exists() {
+        bail!("Target not found: {}", target_dir.display());
+    }
+
+    let mut metadata: DependencyMetadata = load_metadata(&target_dir)?;
+
+    if args.status {
+        if let Some(update_state) = metadata.update_state {
+            println!("Active update state:");
+            for (idx, patch) in update_state.patches.iter().enumerate() {
+                println!("{}. {} - {}", idx + 1, patch.name, patch.state);
+            }
+        } else {
+            println!("No active update");
+        }
+
+        return Ok(());
+    }
+
+    let version = get_update_version(&args, &metadata)?;
+
+    if version == metadata.version && !args.force {
+        bail!("Already on the specified version");
+    }
+
+    let repo_dir = target_dir.join("repo");
+    if !repo_dir.exists() && !args.force {
+        bail!("Repo dir not found: {}", repo_dir.display());
+    }
+
+    fs::remove_dir_all(&repo_dir)?;
+
+    let mut clone_cmd = Command::new("git");
+    clone_cmd.args(["clone", &metadata.url, repo_dir.to_str().unwrap()]);
+    run_command(clone_cmd, "clone", None).context("Failed to clone repo")?;
+
+    let mut checkout_version_cmd = Command::new("git");
+    checkout_version_cmd
+        .current_dir(&repo_dir)
+        .args(["checkout", &version]);
+
+    fs::remove_dir_all(repo_dir.join(".git"))?;
+
+    metadata.version = version.clone();
+    metadata.update_state = Some(UpdateState {
+        prev_commit_hash: get_current_commit()?,
+        patches: load_patch_list(&target_dir)?
+            .iter()
+            .map(|e| PatchApplyState {
+                name: e.clone(),
+                state: PatchState::Pending,
+            })
+            .collect(),
+    });
+    update_metadata(&target_dir, &metadata)?;
+
+    let commit_message = format!("Update {} to {}", &args.path.unwrap(), version);
+    commit_code(&commit_message)?;
+
     unimplemented!("Update is not yet implemented")
+}
+
+pub fn commit_code(message: &str) -> Result<()> {
+    let commit_cmd = Command::new("git")
+        .args(["commit", "-a", "-m", message])
+        .output()?;
+
+    if !commit_cmd.status.success() {
+        bail!(
+            "git commit failed, stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&commit_cmd.stdout),
+            String::from_utf8_lossy(&commit_cmd.stderr),
+        );
+    }
+
+    Ok(())
+}
+
+pub fn ensure_git_clean() -> Result<()> {
+    let git_cmd = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()?;
+
+    if !git_cmd.status.success() {
+        bail!(
+            "git status failed: stdout: {} stderr: {}",
+            String::from_utf8_lossy(&git_cmd.stdout),
+            String::from_utf8_lossy(&git_cmd.stderr),
+        );
+    }
+
+    if git_cmd.stdout.len() > 0 {
+        bail!(
+            "git must be clean, but has changes:\n {}",
+            String::from_utf8_lossy(&git_cmd.stdout),
+        );
+    }
+
+    Ok(())
+}
+
+fn load_patch_list(target_dir: &PathBuf) -> Result<Vec<String>> {
+    let patches_dir = target_dir.join("patches");
+
+    let mut patches = Vec::new();
+    for entry in fs::read_dir(&patches_dir)? {
+        let entry = entry?;
+        let fname = entry.file_name().into_string().unwrap();
+        if let Some(n_str) = fname.split('-').next() {
+            if let Ok(n) = n_str.parse::<u32>() {
+                patches.push((n, fname));
+            } else {
+                bail!("");
+            }
+        } else {
+            bail!("");
+        }
+    }
+
+    patches.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(patches.iter().map(|e| e.1.clone()).collect())
 }
 
 pub fn extract_patch(args: ExtractPatchCommandArgs, paths: &paths::MonorepoPaths) -> Result<()> {

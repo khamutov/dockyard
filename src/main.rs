@@ -49,10 +49,27 @@ struct UpdateCommandArgs {
     #[arg(
         long,
         help = " \
-        Update third party dependency under specified path. \
-        The path must be provided in the canonical format: //third_party/dep_name"
+        Tag or commit hash to import. If skipped then HEAD will be used."
     )]
-    path: String,
+    version: Option<String>,
+    #[arg(
+        long,
+        help = " \
+        Force update and re-apply pathces even if version is the same.",
+        default_value_t = false
+    )]
+    force: bool,
+    #[arg(
+        long,
+        help = " \
+        Show update status.",
+        default_value_t = false
+    )]
+    status: bool,
+    #[arg(help = " \
+        Update third party dependency under specified path. \
+        The path must be provided in the canonical format: //third_party/dep_name")]
+    path: Option<String>,
 }
 
 #[derive(Debug, Parser)]
