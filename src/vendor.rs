@@ -740,6 +740,15 @@ index 83db48f..efc6926 100644
             new_metadata.update_state.unwrap()
         );
 
+        let content = fs::read_to_string(target_dir.join("repo/a.txt"))?;
+        assert_eq!(
+            content,
+            "line123
+line2
+line3
+"
+        );
+
         Ok(())
     }
 
