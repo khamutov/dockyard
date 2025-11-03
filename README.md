@@ -77,11 +77,45 @@ This generates numbered patch files in `third_party/example/patches/` that must 
 
 ### Update Vendored Dependencies
 
-*Note: Update functionality is planned but not yet implemented.*
-
-Update existing dependencies to newer versions:
+Update an existing dependency to the latest upstream version:
 
 ```bash
-NOT IMPLEMENTED
+dockyard update //third_party/example
 ```
 
+This command:
+
+1. Fetches the new version from the upstream repository.
+2. Applies all local patches in sequence.
+
+If a patch fails to apply cleanly, dockyard stops and guides you through conflict resolution.
+
+#### Example
+
+```
+$ dockyard update //third_party/example
+
+...
+
+Patch cannot be applied. What to do next:
+
+1. Try to apply with rejected hunks:
+
+  cd third_party/example
+  git apply --reject --directory=third_party/example/repo ../patches/0001-update-line1.patch
+
+2. Check *.rej files and apply conflicted hunks manually in source files (not in patch).
+3. Run the following command
+
+  dockyard update --continue //third_party/example
+
+It'll refresh the current patch and will continue with subsequent patches.
+
+```
+
+### Plans
+
+Implement
+
+1. Skipping patch: `dockyard update --skip //third_party/example`
+2. `--abort` to restore the previous state (like git rebase --abort).
