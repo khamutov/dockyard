@@ -3,6 +3,7 @@ use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -26,7 +27,7 @@ struct DependencyMetadata {
     update_state: Option<UpdateState>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 enum PatchState {
     Pending,
     Applied,
@@ -45,13 +46,13 @@ impl Display for PatchState {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct PatchApplyState {
     name: String,
     state: PatchState,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct UpdateState {
     prev_commit_hash: String,
     patches: Vec<PatchApplyState>,
@@ -190,7 +191,7 @@ pub fn update(args: UpdateCommandArgs, paths: &paths::MonorepoPaths) -> Result<(
         update_metadata(&target_dir, &metadata)?;
 
         let commit_msg = format!("Update metadata for {}", &canonical_path);
-        commit_code(&commit_msg)?;
+        commit_code(&commit_msg, &paths.root)?;
         println!("All patches were applied");
         return Ok(());
     }
@@ -233,7 +234,7 @@ pub fn update(args: UpdateCommandArgs, paths: &paths::MonorepoPaths) -> Result<(
     update_metadata(&target_dir, &metadata)?;
 
     let commit_message = format!("Update {} to {}", &canonical_path, version);
-    commit_code(&commit_message)?;
+    commit_code(&commit_message, &paths.root)?;
 
     apply_patches(&target_dir, &canonical_path, paths, &mut metadata)?;
 
@@ -241,7 +242,7 @@ pub fn update(args: UpdateCommandArgs, paths: &paths::MonorepoPaths) -> Result<(
     update_metadata(&target_dir, &metadata)?;
 
     let commit_msg = format!("Update metadata for {}", &canonical_path);
-    commit_code(&commit_msg)?;
+    commit_code(&commit_msg, &paths.root)?;
     println!("All patches were applied");
     Ok(())
 }
@@ -272,7 +273,7 @@ fn apply_patches(
                                 patch.name,
                                 &canonical_path,
                             );
-                            commit_code(&commit_msg)?;
+                            commit_code(&commit_msg, &paths.root)?;
                             println!(
                                 "Successfully applied patch ({}/{}) {} for {}",
                                 idx + 1,
@@ -316,7 +317,7 @@ fn apply_patches(
                         "Resolve conflicted patch ({}/{}) {} for {}",
                         idx, patches_count, patch.name, &canonical_path,
                     );
-                    commit_code(&commit_msg)?;
+                    commit_code(&commit_msg, &paths.root)?;
                 }
                 PatchState::Resolved => {
                     println!("Skipping already applied patch {}", patch.name);
@@ -354,8 +355,28 @@ fn try_apply_patch(
     }
 }
 
-fn commit_code(message: &str) -> Result<()> {
+fn git_add_all(current_dir: &Path) -> Result<()> {
+    let git_cmd = Command::new("git")
+        .current_dir(current_dir)
+        .args(["add", "."])
+        .output()?;
+
+    if !git_cmd.status.success() {
+        bail!(
+            "git add failed, stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&git_cmd.stdout),
+            String::from_utf8_lossy(&git_cmd.stderr),
+        );
+    }
+
+    Ok(())
+}
+
+fn commit_code(message: &str, current_dir: &Path) -> Result<()> {
+    git_add_all(&current_dir)?;
+
     let commit_cmd = Command::new("git")
+        .current_dir(current_dir)
         .args(["commit", "-a", "-m", message])
         .output()?;
 
@@ -502,14 +523,16 @@ fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<
 mod tests {
     use std::{
         fs,
+        path::Path,
         process::Command,
         sync::{Mutex, OnceLock},
     };
 
     use anyhow::{Context, bail};
     use dockyard::{paths::path_to_abs, *};
+    use tempfile::{TempDir, tempdir};
 
-    use crate::vendor::extract_diff;
+    use super::*;
 
     static GIT_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -649,5 +672,105 @@ index 0000000..c0d0fb4
         } else {
             bail!("expected to produce error with untracked files")
         }
+    }
+
+    #[test]
+    fn test_update_apply_patches() -> anyhow::Result<()> {
+        let temp_dir = create_test_dir()?;
+
+        let target_dir = temp_dir.path().join("third_party/example");
+
+        let mut metadata = DependencyMetadata {
+            url: "empty".to_string(),
+            version: "default".to_string(),
+            update_state: None,
+        };
+        update_metadata(&target_dir, &metadata)?;
+
+        fs::write(
+            target_dir.join("repo/a.txt"),
+            "line1
+line2
+line3
+",
+        )?;
+        commit_code("Initial commit", &temp_dir.path())?;
+
+        let paths = paths::MonorepoPaths::from_dir(temp_dir.path())
+            .context("Could not find monorepo checkout paths")?;
+
+        let canonical_path = "//third_party/example";
+        let target_dir = path_to_abs(&paths, canonical_path)?;
+
+        fs::write(
+            target_dir.join("patches/0001-update-line1.patch"),
+            "diff --git a/a.txt b/a.txt
+index 83db48f..efc6926 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+-line1
++line123
+ line2
+ line3
+",
+        )?;
+        commit_code("Create patch1", &target_dir)?;
+
+        // make all patches pending
+        metadata.update_state = Some(UpdateState {
+            prev_commit_hash: get_current_commit()?,
+            patches: load_patch_list(&target_dir)?
+                .iter()
+                .map(|e| PatchApplyState {
+                    name: e.clone(),
+                    state: PatchState::Pending,
+                })
+                .collect(),
+        });
+        update_metadata(&target_dir, &metadata)?;
+
+        apply_patches(&target_dir, canonical_path, &paths, &mut metadata)?;
+
+        let new_metadata = load_metadata(&target_dir)?;
+        assert_eq!(
+            new_metadata.update_state.clone().unwrap().patches[0].state,
+            PatchState::Applied,
+            "expected Applied state for the patch, got {:?}",
+            new_metadata.update_state.unwrap()
+        );
+
+        Ok(())
+    }
+
+    fn create_test_dir() -> anyhow::Result<TempDir> {
+        let temp_dir = tempdir()?;
+
+        fs::create_dir_all(temp_dir.path().join("third_party"))?;
+
+        // create expected dir structure
+        fs::create_dir_all(temp_dir.path().join("third_party/example/repo"))?;
+        fs::create_dir_all(temp_dir.path().join("third_party/example/patches"))?;
+
+        init_git(temp_dir.path())?;
+
+        Ok(temp_dir)
+    }
+
+    fn init_git(current_dir: &Path) -> anyhow::Result<()> {
+        let commit_cmd = Command::new("git")
+            .current_dir(current_dir)
+            .args(["init"])
+            .output()?;
+
+        if !commit_cmd.status.success() {
+            bail!(
+                "git init failed, stdout: {}, stderr: {}",
+                String::from_utf8_lossy(&commit_cmd.stdout),
+                String::from_utf8_lossy(&commit_cmd.stderr),
+            );
+        }
+
+        Ok(())
     }
 }

@@ -35,6 +35,16 @@ impl MonorepoPaths {
             third_party: check_path(&root_dir, third_party_path)?,
         })
     }
+
+    /// Create the `MonorepoPath` resolver from provided root dir.
+    pub fn from_dir(path: &Path) -> io::Result<MonorepoPaths> {
+        let root_dir = path.to_path_buf();
+
+        Ok(MonorepoPaths {
+            root: root_dir.clone(),
+            third_party: check_path(&root_dir, THIRD_PARTY_DIR)?,
+        })
+    }
 }
 
 fn check_path(root: &Path, p_str: &str) -> io::Result<PathBuf> {
