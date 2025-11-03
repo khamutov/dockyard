@@ -1,4 +1,3 @@
-use std::env::current_dir;
 use std::fmt::Display;
 use std::fs;
 use std::fs::File;
@@ -542,12 +541,7 @@ fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::Path,
-        process::Command,
-        sync::{Mutex, OnceLock},
-    };
+    use std::{fs, path::Path, process::Command};
 
     use anyhow::{Context, bail};
     use dockyard::{paths::path_to_abs, *};
@@ -555,34 +549,20 @@ mod tests {
 
     use super::*;
 
-    static GIT_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn test_lock() -> &'static Mutex<()> {
-        GIT_TEST_MUTEX.get_or_init(|| Mutex::new(()))
-    }
-
     #[test]
     fn test_extract_patch() -> anyhow::Result<()> {
-        let _guard = test_lock().lock().unwrap();
+        let temp_dir = create_test_dir()?;
 
-        let paths = paths::MonorepoPaths::from_third_party_dir("test_dir")
+        let paths = paths::MonorepoPaths::from_dir(temp_dir.path())
             .context("Could not find monorepo checkout paths")?;
-        let target_dir = path_to_abs(&paths, "//test_dir/repo_extract")?;
+        let target_dir = path_to_abs(&paths, "//third_party/repo_extract")?;
         fs::create_dir_all(&target_dir)?;
+        fs::write(temp_dir.path().join(".keep"), "")?;
+        commit_code("Initial commit", temp_dir.path())?;
 
         fs::write(target_dir.join("tesfile.txt"), "line1\nline2\n")?;
 
-        let add_file_to_git = Command::new("git")
-            .args(["add", target_dir.to_str().unwrap()])
-            .output()?;
-        if !add_file_to_git.status.success() {
-            bail!(
-                "git add faile, stdout: {}, stderr: {}",
-                String::from_utf8_lossy(&add_file_to_git.stdout),
-                String::from_utf8_lossy(&add_file_to_git.stderr),
-            );
-        }
-
+        git_add_all(&paths.root)?;
         let diff = extract_diff(&target_dir, &paths)?;
 
         let diff_str = String::from_utf8_lossy(&diff);
@@ -598,22 +578,6 @@ index 0000000..c0d0fb4
 ";
         assert_eq!(diff_str, expected_diff);
 
-        let remove_files_from_git = Command::new("git")
-            .args([
-                "restore",
-                "--staged",
-                target_dir.join("tesfile.txt").to_str().unwrap(),
-            ])
-            .output()?;
-        if !remove_files_from_git.status.success() {
-            bail!(
-                "git restore staged file failed, stdout: {}, stderr: {}",
-                String::from_utf8_lossy(&remove_files_from_git.stdout),
-                String::from_utf8_lossy(&remove_files_from_git.stderr),
-            );
-        }
-        fs::remove_dir_all(target_dir)?;
-
         Ok(())
     }
 
@@ -621,27 +585,19 @@ index 0000000..c0d0fb4
     fn test_extract_patch_with_repo_subdir() -> anyhow::Result<()> {
         // Git expects forward slashes ('/') as the path separator. So let's check that the
         // functions works properly with possible backslashes after PahtBuf::join as well.
-        let _guard = test_lock().lock().unwrap();
+        let temp_dir = create_test_dir()?;
 
-        let paths = paths::MonorepoPaths::from_third_party_dir("test_dir")
+        let paths = paths::MonorepoPaths::from_dir(temp_dir.path())
             .context("Could not find monorepo checkout paths")?;
-        let target_dir = path_to_abs(&paths, "//test_dir/repo_extract_backslash")?;
+        let target_dir = path_to_abs(&paths, "//third_party/repo_extract_backslash")?;
         let repo_dir = target_dir.join("repo");
         fs::create_dir_all(&repo_dir)?;
+        fs::write(temp_dir.path().join(".keep"), "")?;
+        commit_code("Initial commit", temp_dir.path())?;
 
         fs::write(repo_dir.join("tesfile.txt"), "line1\nline2\n")?;
 
-        let add_file_to_git = Command::new("git")
-            .args(["add", target_dir.to_str().unwrap()])
-            .output()?;
-        if !add_file_to_git.status.success() {
-            bail!(
-                "git add faile, stdout: {}, stderr: {}",
-                String::from_utf8_lossy(&add_file_to_git.stdout),
-                String::from_utf8_lossy(&add_file_to_git.stderr),
-            );
-        }
-
+        git_add_all(&paths.root)?;
         let diff = extract_diff(&repo_dir, &paths)?;
 
         let diff_str = String::from_utf8_lossy(&diff);
@@ -657,42 +613,24 @@ index 0000000..c0d0fb4
 ";
         assert_eq!(diff_str, expected_diff);
 
-        let remove_files_from_git = Command::new("git")
-            .args([
-                "restore",
-                "--staged",
-                repo_dir.join("tesfile.txt").to_str().unwrap(),
-            ])
-            .output()?;
-        if !remove_files_from_git.status.success() {
-            bail!(
-                "git restore staged file failed, stdout: {}, stderr: {}",
-                String::from_utf8_lossy(&remove_files_from_git.stdout),
-                String::from_utf8_lossy(&remove_files_from_git.stderr),
-            );
-        }
-        fs::remove_dir_all(target_dir)?;
-
         Ok(())
     }
 
     #[test]
     fn test_extract_patch_error_on_untracked() -> anyhow::Result<()> {
-        let _guard = test_lock().lock().unwrap();
+        let temp_dir = create_test_dir()?;
 
-        let paths = paths::MonorepoPaths::from_third_party_dir("test_dir")
+        let paths = paths::MonorepoPaths::from_dir(temp_dir.path())
             .context("Could not find monorepo checkout paths")?;
-        let target_dir = path_to_abs(&paths, "//test_dir/repo_untracked")?;
+        let target_dir = path_to_abs(&paths, "//third_party/repo_untracked")?;
         fs::create_dir_all(&target_dir)?;
 
         fs::write(target_dir.join("tesfile.txt"), "line1\nline2\n")?;
 
-        if let Err(_) = extract_diff(&target_dir, &paths) {
-            fs::remove_dir_all(target_dir)?;
-            Ok(())
-        } else {
-            bail!("expected to produce error with untracked files")
-        }
+        let res = extract_diff(&target_dir, &paths);
+        assert!(res.is_err(), "Expected Err, but get {:?}", res);
+
+        Ok(())
     }
 
     #[test]
