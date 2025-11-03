@@ -1,3 +1,4 @@
+use std::env::current_dir;
 use std::fmt::Display;
 use std::fs;
 use std::fs::File;
@@ -287,8 +288,26 @@ fn apply_patches(
                             metadata.update_state = Some(update_state_mut.clone());
                             update_metadata(target_dir, metadata)?;
 
+                            let relative_target_path = target_dir.strip_prefix(&paths.root)?;
                             print!(
-                                "Patch cannot be applied, fix conflicts and run\n\n:\tdockyard update --continue {}\n",
+                                "Patch cannot be applied. What to do next:
+
+1. Try to apply with rejected hunks:
+
+  cd {}
+  git apply --reject --directory={}/repo ../patches/{}
+
+2. Check *.rej files and apply conflicted hunks manually in source files (not in patch).
+3. Run the following command
+
+  dockyard update --continue {}
+
+It'll refresh the current patch and will continue with subsequent patches.
+
+",
+                                relative_target_path.display(),
+                                relative_target_path.display(),
+                                patch.name,
                                 canonical_path
                             );
                             bail!("Failed apply patch");
@@ -483,6 +502,7 @@ fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<
     let relative_path = relative_path.to_string_lossy().replace('\\', "/");
 
     let ls = Command::new("git")
+        .current_dir(&paths.root)
         .args(["ls-files", "--others", "--exclude-standard", &repo_dir])
         .output()?;
     if !ls.status.success() {
@@ -498,6 +518,7 @@ fn extract_diff(repo_dir: &PathBuf, paths: &paths::MonorepoPaths) -> Result<Vec<
     }
 
     let patch_cmd = Command::new("git")
+        .current_dir(&paths.root)
         .args([
             "diff".to_string(),
             // include all files (from index and unstaged)
@@ -851,6 +872,184 @@ line4
         Ok(())
     }
 
+    #[test]
+    fn test_update_apply_patch_with_conflict() -> anyhow::Result<()> {
+        let temp_dir = create_test_dir()?;
+
+        let target_dir = temp_dir.path().join("third_party/example");
+
+        let mut metadata = DependencyMetadata {
+            url: "empty".to_string(),
+            version: "default".to_string(),
+            update_state: None,
+        };
+        update_metadata(&target_dir, &metadata)?;
+
+        fs::write(
+            target_dir.join("repo/a.txt"),
+            "line1
+line2
+line3
+",
+        )?;
+        commit_code("Initial commit", &temp_dir.path())?;
+
+        let paths = paths::MonorepoPaths::from_dir(temp_dir.path())
+            .context("Could not find monorepo checkout paths")?;
+
+        let canonical_path = "//third_party/example";
+        let target_dir = path_to_abs(&paths, canonical_path)?;
+
+        fs::write(
+            target_dir.join("patches/0001-update-line1.patch"),
+            "diff --git a/a.txt b/a.txt
+index 83db48f..efc6926 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+-line999
++line123
+ line2
+ line3
+",
+        )?;
+        commit_code("Create patch1", &target_dir)?;
+
+        // make all patches pending
+        metadata.update_state = Some(UpdateState {
+            prev_commit_hash: get_current_commit()?,
+            patches: load_patch_list(&target_dir)?
+                .iter()
+                .map(|e| PatchApplyState {
+                    name: e.clone(),
+                    state: PatchState::Pending,
+                })
+                .collect(),
+        });
+        update_metadata(&target_dir, &metadata)?;
+
+        let apply_result = apply_patches(&target_dir, canonical_path, &paths, &mut metadata);
+        assert!(
+            apply_result.is_err(),
+            "Expected Err, but got {:?}",
+            apply_result
+        );
+
+        let new_metadata = load_metadata(&target_dir)?;
+        assert_eq!(
+            new_metadata.update_state.clone().unwrap().patches[0].state,
+            PatchState::Conflict,
+            "expected Conflict state for the patch, got {:?}",
+            new_metadata.update_state.unwrap()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_apply_patch_with_conflict_and_continue() -> anyhow::Result<()> {
+        let temp_dir = create_test_dir()?;
+
+        let target_dir = temp_dir.path().join("third_party/example");
+
+        let mut metadata = DependencyMetadata {
+            url: "empty".to_string(),
+            version: "default".to_string(),
+            update_state: None,
+        };
+        update_metadata(&target_dir, &metadata)?;
+
+        fs::write(
+            target_dir.join("repo/a.txt"),
+            "line1
+line2
+line3
+",
+        )?;
+        commit_code("Initial commit", &temp_dir.path())?;
+
+        let paths = paths::MonorepoPaths::from_dir(temp_dir.path())
+            .context("Could not find monorepo checkout paths")?;
+
+        let canonical_path = "//third_party/example";
+        let target_dir = path_to_abs(&paths, canonical_path)?;
+
+        fs::write(
+            target_dir.join("patches/0001-update-line1.patch"),
+            "diff --git a/a.txt b/a.txt
+index 83db48f..efc6926 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+-line999
++line123
+ line2
+ line3
+",
+        )?;
+        commit_code("Create patch1", &target_dir)?;
+
+        // make all patches pending
+        metadata.update_state = Some(UpdateState {
+            prev_commit_hash: get_current_commit()?,
+            patches: load_patch_list(&target_dir)?
+                .iter()
+                .map(|e| PatchApplyState {
+                    name: e.clone(),
+                    state: PatchState::Pending,
+                })
+                .collect(),
+        });
+        update_metadata(&target_dir, &metadata)?;
+
+        let apply_result = apply_patches(&target_dir, canonical_path, &paths, &mut metadata);
+        assert!(
+            apply_result.is_err(),
+            "Expected Err, but got {:?}",
+            apply_result
+        );
+
+        let new_metadata = load_metadata(&target_dir)?;
+        assert_eq!(
+            new_metadata.update_state.clone().unwrap().patches[0].state,
+            PatchState::Conflict,
+            "expected Conflict state for the patch, got {:?}",
+            new_metadata.update_state.unwrap()
+        );
+
+        fs::write(
+            target_dir.join("repo/a.txt"),
+            "line333
+line2
+line3
+",
+        )?;
+        apply_patches(&target_dir, canonical_path, &paths, &mut metadata)?;
+
+        let new_metadata = load_metadata(&target_dir)?;
+        assert_eq!(
+            new_metadata.update_state.clone().unwrap().patches[0].state,
+            PatchState::Resolved,
+            "expected Resolved state for the patch, got {:?}",
+            new_metadata.update_state.unwrap()
+        );
+
+        let patch_content = fs::read_to_string(target_dir.join("patches/0001-update-line1.patch"))?;
+        assert_eq!(
+            normalize_patch(&patch_content),
+            "diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+-line1
++line333
+ line2
+ line3",
+        );
+
+        Ok(())
+    }
+
     fn create_test_dir() -> anyhow::Result<TempDir> {
         let temp_dir = tempdir()?;
 
@@ -880,5 +1079,13 @@ line4
         }
 
         Ok(())
+    }
+
+    // Removes for testing unstable lines (e.g. index with blob hashes) from patches
+    fn normalize_patch(p: &str) -> String {
+        p.lines()
+            .filter(|l| !l.starts_with("index "))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
