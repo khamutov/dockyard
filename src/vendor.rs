@@ -752,6 +752,105 @@ line3
         Ok(())
     }
 
+    #[test]
+    fn test_update_apply_multiple_patches() -> anyhow::Result<()> {
+        let temp_dir = create_test_dir()?;
+
+        let target_dir = temp_dir.path().join("third_party/example");
+
+        let mut metadata = DependencyMetadata {
+            url: "empty".to_string(),
+            version: "default".to_string(),
+            update_state: None,
+        };
+        update_metadata(&target_dir, &metadata)?;
+
+        fs::write(
+            target_dir.join("repo/a.txt"),
+            "line1
+line2
+line3
+",
+        )?;
+        commit_code("Initial commit", &temp_dir.path())?;
+
+        let paths = paths::MonorepoPaths::from_dir(temp_dir.path())
+            .context("Could not find monorepo checkout paths")?;
+
+        let canonical_path = "//third_party/example";
+        let target_dir = path_to_abs(&paths, canonical_path)?;
+
+        fs::write(
+            target_dir.join("patches/0001-update-line1.patch"),
+            "diff --git a/a.txt b/a.txt
+index 83db48f..efc6926 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+-line1
++line123
+ line2
+ line3
+",
+        )?;
+        commit_code("Create patch1", &target_dir)?;
+
+        fs::write(
+            target_dir.join("patches/0002-update-line4.patch"),
+            "diff --git a/a.txt b/a.txt
+index 83db48f..efc6926 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+-line123
+ line2
+ line3
++line4
+",
+        )?;
+        commit_code("Create patch2", &target_dir)?;
+
+        // make all patches pending
+        metadata.update_state = Some(UpdateState {
+            prev_commit_hash: get_current_commit()?,
+            patches: load_patch_list(&target_dir)?
+                .iter()
+                .map(|e| PatchApplyState {
+                    name: e.clone(),
+                    state: PatchState::Pending,
+                })
+                .collect(),
+        });
+        update_metadata(&target_dir, &metadata)?;
+
+        apply_patches(&target_dir, canonical_path, &paths, &mut metadata)?;
+
+        let new_metadata = load_metadata(&target_dir)?;
+        assert_eq!(
+            new_metadata.update_state.clone().unwrap().patches[0].state,
+            PatchState::Applied,
+            "expected Applied state for the patch, got {:?}",
+            new_metadata.update_state.unwrap()
+        );
+        assert_eq!(
+            new_metadata.update_state.clone().unwrap().patches[1].state,
+            PatchState::Applied,
+            "expected Applied state for the patch, got {:?}",
+            new_metadata.update_state.unwrap()
+        );
+
+        let content = fs::read_to_string(target_dir.join("repo/a.txt"))?;
+        assert_eq!(
+            content,
+            "line2
+line3
+line4
+"
+        );
+
+        Ok(())
+    }
+
     fn create_test_dir() -> anyhow::Result<TempDir> {
         let temp_dir = tempdir()?;
 
