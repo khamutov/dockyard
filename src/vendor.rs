@@ -157,7 +157,7 @@ pub fn get_current_commit() -> Result<String> {
 }
 
 pub fn update(args: UpdateCommandArgs, paths: &paths::MonorepoPaths) -> Result<()> {
-    ensure_git_clean()?;
+    ensure_git_clean(&paths.root)?;
     let canonical_path = &args.path.as_ref().unwrap();
 
     let target_dir = path_to_abs(paths, &canonical_path)?;
@@ -409,8 +409,9 @@ fn commit_code(message: &str, current_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_git_clean() -> Result<()> {
+fn ensure_git_clean(current_dir: &Path) -> Result<()> {
     let git_cmd = Command::new("git")
+        .current_dir(current_dir)
         .args(["status", "--porcelain"])
         .output()?;
 
@@ -984,6 +985,85 @@ line3
  line2
  line3",
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn integration_vendor_and_patch_test() -> anyhow::Result<()> {
+        let temp_dir = create_test_dir()?;
+
+        fs::write(temp_dir.path().join(".keep"), "")?;
+        fs::create_dir_all(temp_dir.path().join("third_party"))?;
+        commit_code("Initial commit", &temp_dir.path())?;
+
+        let paths = MonorepoPaths::from_dir(temp_dir.path())?;
+
+        // Vendor third-party dep
+        vendor(
+            VendorCommandArgs {
+                git: "https://github.com/khamutov/dockyard.git".to_string(),
+                version: Some("879bfd9".to_string()),
+                path: "//third_party/dockyard".to_string(),
+            },
+            &paths,
+        )?;
+        commit_code("Vendor dockyard", &temp_dir.path())?;
+
+        // Edit Cargo.toml
+        fs::write(
+            temp_dir.path().join("third_party/dockyard/repo/Cargo.toml"),
+            r#"[package]
+name = "dockyard-vendored"
+description = "Monorepo managment tool"
+authors = ["Aleksandr Khamutov"]
+version = "0.0.0"
+edition = "2024"
+license-file = "LICENSE"
+
+[dependencies]
+anyhow = "1.0.98"
+clap = {version = "4.5.38", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+"#,
+        )?;
+        extract_patch(
+            ExtractPatchCommandArgs {
+                path: "//third_party/dockyard".to_string(),
+            },
+            &paths,
+        )?;
+        git_add_all(temp_dir.path())?;
+        commit_code("Update vendored package name", temp_dir.path())?;
+
+        // Update vendored code to new version
+        update(
+            UpdateCommandArgs {
+                version: Some("a784ec0".to_string()),
+                force: false,
+                status: false,
+                cont: false,
+                path: Some("//third_party/dockyard".to_string()),
+            },
+            &paths,
+        )?;
+
+        let cargo_toml_content: Vec<String> =
+            fs::read_to_string(temp_dir.path().join("third_party/dockyard/repo/Cargo.toml"))?
+                .lines()
+                .map(|s| s.to_string())
+                .collect();
+
+        // Check the patch was applied to new code
+        assert!(cargo_toml_content.len() > 2);
+        assert_eq!(cargo_toml_content[1], "name = \"dockyard-vendored\"");
+
+        let metadata: DependencyMetadata =
+            load_metadata(&temp_dir.path().join("third_party/dockyard"))?;
+
+        // Check the version was updated in metadata
+        assert_eq!(metadata.version, "a784ec0");
 
         Ok(())
     }
