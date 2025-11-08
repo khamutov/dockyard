@@ -55,6 +55,7 @@ struct PatchApplyState {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct UpdateState {
     prev_commit_hash: String,
+    new_version: String,
     patches: Vec<PatchApplyState>,
 }
 
@@ -148,8 +149,11 @@ fn get_update_version(args: &UpdateCommandArgs, metadata: &DependencyMetadata) -
     }
 }
 
-pub fn get_current_commit() -> Result<String> {
-    let version_cmd = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
+pub fn get_current_commit(current_dir: &Path) -> Result<String> {
+    let version_cmd = Command::new("git")
+        .current_dir(current_dir)
+        .args(["rev-parse", "HEAD"])
+        .output()?;
     if !version_cmd.status.success() {
         bail!("git rev-parse failed");
     }
@@ -157,7 +161,6 @@ pub fn get_current_commit() -> Result<String> {
 }
 
 pub fn update(args: UpdateCommandArgs, paths: &paths::MonorepoPaths) -> Result<()> {
-    ensure_git_clean(&paths.root)?;
     let canonical_path = &args.path.as_ref().unwrap();
 
     let target_dir = path_to_abs(paths, &canonical_path)?;
@@ -181,63 +184,71 @@ pub fn update(args: UpdateCommandArgs, paths: &paths::MonorepoPaths) -> Result<(
         return Ok(());
     }
 
+    if args.abort {
+        if let Some(ref state) = metadata.update_state {
+            revert_to_commit(&state.prev_commit_hash, &paths.root)?;
+            println!(
+                "Aborted update, reverted to commit {}",
+                state.prev_commit_hash
+            );
+            return Ok(());
+        } else {
+            bail!("No active update state");
+        }
+    }
+
     if args.cont {
         if metadata.update_state.is_none() {
             bail!("No active update state");
         }
         apply_patches(&target_dir, &canonical_path, paths, &mut metadata)?;
+    } else {
+        // Update code from upstream
+        ensure_git_clean(&paths.root)?;
+        let version = get_update_version(&args, &metadata)?;
 
-        metadata.update_state = None;
+        if version == metadata.version && !args.force {
+            bail!("Already on the specified version");
+        }
+
+        let repo_dir = target_dir.join("repo");
+        if !repo_dir.exists() && !args.force {
+            bail!("Repo dir not found: {}", repo_dir.display());
+        }
+
+        fs::remove_dir_all(&repo_dir)?;
+
+        let mut clone_cmd = Command::new("git");
+        clone_cmd.args(["clone", &metadata.url, repo_dir.to_str().unwrap()]);
+        run_command(clone_cmd, "clone", None).context("Failed to clone repo")?;
+
+        let mut checkout_version_cmd = Command::new("git");
+        checkout_version_cmd
+            .current_dir(&repo_dir)
+            .args(["checkout", &version]);
+
+        fs::remove_dir_all(repo_dir.join(".git"))?;
+
+        metadata.update_state = Some(UpdateState {
+            prev_commit_hash: get_current_commit(&paths.root)?,
+            new_version: version.clone(),
+            patches: load_patch_list(&target_dir)?
+                .iter()
+                .map(|e| PatchApplyState {
+                    name: e.clone(),
+                    state: PatchState::Pending,
+                })
+                .collect(),
+        });
         update_metadata(&target_dir, &metadata)?;
 
-        let commit_msg = format!("Update metadata for {}", &canonical_path);
-        commit_code(&commit_msg, &paths.root)?;
-        println!("All patches were applied");
-        return Ok(());
+        let commit_message = format!("Update {} to {}", &canonical_path, version);
+        commit_code(&commit_message, &paths.root)?;
+
+        apply_patches(&target_dir, &canonical_path, paths, &mut metadata)?;
     }
 
-    let version = get_update_version(&args, &metadata)?;
-
-    if version == metadata.version && !args.force {
-        bail!("Already on the specified version");
-    }
-
-    let repo_dir = target_dir.join("repo");
-    if !repo_dir.exists() && !args.force {
-        bail!("Repo dir not found: {}", repo_dir.display());
-    }
-
-    fs::remove_dir_all(&repo_dir)?;
-
-    let mut clone_cmd = Command::new("git");
-    clone_cmd.args(["clone", &metadata.url, repo_dir.to_str().unwrap()]);
-    run_command(clone_cmd, "clone", None).context("Failed to clone repo")?;
-
-    let mut checkout_version_cmd = Command::new("git");
-    checkout_version_cmd
-        .current_dir(&repo_dir)
-        .args(["checkout", &version]);
-
-    fs::remove_dir_all(repo_dir.join(".git"))?;
-
-    metadata.version = version.clone();
-    metadata.update_state = Some(UpdateState {
-        prev_commit_hash: get_current_commit()?,
-        patches: load_patch_list(&target_dir)?
-            .iter()
-            .map(|e| PatchApplyState {
-                name: e.clone(),
-                state: PatchState::Pending,
-            })
-            .collect(),
-    });
-    update_metadata(&target_dir, &metadata)?;
-
-    let commit_message = format!("Update {} to {}", &canonical_path, version);
-    commit_code(&commit_message, &paths.root)?;
-
-    apply_patches(&target_dir, &canonical_path, paths, &mut metadata)?;
-
+    metadata.version = metadata.update_state.unwrap().new_version;
     metadata.update_state = None;
     update_metadata(&target_dir, &metadata)?;
 
@@ -427,6 +438,25 @@ fn ensure_git_clean(current_dir: &Path) -> Result<()> {
         bail!(
             "git must be clean, but has changes:\n {}",
             String::from_utf8_lossy(&git_cmd.stdout),
+        );
+    }
+
+    Ok(())
+}
+
+fn revert_to_commit(hash: &str, current_dir: &Path) -> Result<()> {
+    git_add_all(&current_dir)?;
+
+    let commit_cmd = Command::new("git")
+        .current_dir(current_dir)
+        .args(["reset", "--hard", hash])
+        .output()?;
+
+    if !commit_cmd.status.success() {
+        bail!(
+            "git reset failed, stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&commit_cmd.stdout),
+            String::from_utf8_lossy(&commit_cmd.stderr),
         );
     }
 
@@ -679,7 +709,8 @@ index 83db48f..efc6926 100644
 
         // make all patches pending
         metadata.update_state = Some(UpdateState {
-            prev_commit_hash: get_current_commit()?,
+            prev_commit_hash: get_current_commit(&paths.root)?,
+            new_version: "12345".to_string(),
             patches: load_patch_list(&target_dir)?
                 .iter()
                 .map(|e| PatchApplyState {
@@ -772,7 +803,8 @@ index 83db48f..efc6926 100644
 
         // make all patches pending
         metadata.update_state = Some(UpdateState {
-            prev_commit_hash: get_current_commit()?,
+            prev_commit_hash: get_current_commit(&paths.root)?,
+            new_version: "12345".to_string(),
             patches: load_patch_list(&target_dir)?
                 .iter()
                 .map(|e| PatchApplyState {
@@ -856,7 +888,8 @@ index 83db48f..efc6926 100644
 
         // make all patches pending
         metadata.update_state = Some(UpdateState {
-            prev_commit_hash: get_current_commit()?,
+            prev_commit_hash: get_current_commit(&paths.root)?,
+            new_version: "12345".to_string(),
             patches: load_patch_list(&target_dir)?
                 .iter()
                 .map(|e| PatchApplyState {
@@ -867,7 +900,17 @@ index 83db48f..efc6926 100644
         });
         update_metadata(&target_dir, &metadata)?;
 
-        let apply_result = apply_patches(&target_dir, canonical_path, &paths, &mut metadata);
+        let apply_result = update(
+            UpdateCommandArgs {
+                version: None,
+                force: false,
+                status: false,
+                cont: true,
+                abort: false,
+                path: Some("//third_party/example".to_string()),
+            },
+            &paths,
+        );
         assert!(
             apply_result.is_err(),
             "Expected Err, but got {:?}",
@@ -930,7 +973,8 @@ index 83db48f..efc6926 100644
 
         // make all patches pending
         metadata.update_state = Some(UpdateState {
-            prev_commit_hash: get_current_commit()?,
+            prev_commit_hash: get_current_commit(&paths.root)?,
+            new_version: "12345".to_string(),
             patches: load_patch_list(&target_dir)?
                 .iter()
                 .map(|e| PatchApplyState {
@@ -941,7 +985,17 @@ index 83db48f..efc6926 100644
         });
         update_metadata(&target_dir, &metadata)?;
 
-        let apply_result = apply_patches(&target_dir, canonical_path, &paths, &mut metadata);
+        let apply_result = update(
+            UpdateCommandArgs {
+                version: None,
+                force: false,
+                status: false,
+                cont: true,
+                abort: false,
+                path: Some("//third_party/example".to_string()),
+            },
+            &paths,
+        );
         assert!(
             apply_result.is_err(),
             "Expected Err, but got {:?}",
@@ -963,15 +1017,26 @@ line2
 line3
 ",
         )?;
-        apply_patches(&target_dir, canonical_path, &paths, &mut metadata)?;
+
+        update(
+            UpdateCommandArgs {
+                version: None,
+                force: false,
+                status: false,
+                cont: true,
+                abort: false,
+                path: Some("//third_party/example".to_string()),
+            },
+            &paths,
+        )?;
 
         let new_metadata = load_metadata(&target_dir)?;
-        assert_eq!(
-            new_metadata.update_state.clone().unwrap().patches[0].state,
-            PatchState::Resolved,
-            "expected Resolved state for the patch, got {:?}",
-            new_metadata.update_state.unwrap()
+        assert!(
+            new_metadata.update_state.is_none(),
+            "Expected None, but got {:?}",
+            new_metadata.update_state
         );
+        assert_eq!(new_metadata.version, "12345".to_string());
 
         let patch_content = fs::read_to_string(target_dir.join("patches/0001-update-line1.patch"))?;
         assert_eq!(
@@ -985,6 +1050,102 @@ line3
  line2
  line3",
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_apply_patch_with_conflict_and_abort() -> anyhow::Result<()> {
+        let temp_dir = create_test_dir()?;
+
+        let target_dir = temp_dir.path().join("third_party/example");
+
+        let mut metadata = DependencyMetadata {
+            url: "empty".to_string(),
+            version: "default".to_string(),
+            update_state: None,
+        };
+        update_metadata(&target_dir, &metadata)?;
+
+        fs::write(
+            target_dir.join("repo/a.txt"),
+            "line1
+line2
+line3
+",
+        )?;
+        commit_code("Initial commit", &temp_dir.path())?;
+
+        let paths = paths::MonorepoPaths::from_dir(temp_dir.path())
+            .context("Could not find monorepo checkout paths")?;
+
+        let canonical_path = "//third_party/example";
+        let target_dir = path_to_abs(&paths, canonical_path)?;
+
+        fs::write(
+            target_dir.join("patches/0001-update-line1.patch"),
+            "diff --git a/a.txt b/a.txt
+index 83db48f..efc6926 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+-line999
++line123
+ line2
+ line3
+",
+        )?;
+        commit_code("Create patch1", &target_dir)?;
+
+        // make all patches pending
+        metadata.update_state = Some(UpdateState {
+            prev_commit_hash: get_current_commit(&paths.root)?,
+            new_version: "12345".to_string(),
+            patches: load_patch_list(&target_dir)?
+                .iter()
+                .map(|e| PatchApplyState {
+                    name: e.clone(),
+                    state: PatchState::Pending,
+                })
+                .collect(),
+        });
+        update_metadata(&target_dir, &metadata)?;
+
+        let apply_result = update(
+            UpdateCommandArgs {
+                version: None,
+                force: false,
+                status: false,
+                cont: true,
+                abort: false,
+                path: Some("//third_party/example".to_string()),
+            },
+            &paths,
+        );
+        assert!(
+            apply_result.is_err(),
+            "Expected Err, but got {:?}",
+            apply_result
+        );
+
+        update(
+            UpdateCommandArgs {
+                version: None,
+                force: false,
+                status: false,
+                cont: false,
+                abort: true,
+                path: Some("//third_party/example".to_string()),
+            },
+            &paths,
+        )?;
+        let new_metadata = load_metadata(&target_dir)?;
+        assert!(
+            new_metadata.update_state.is_none(),
+            "Expected None, but got {:?}",
+            new_metadata.update_state
+        );
+        assert_eq!(new_metadata.version, "default".to_string());
 
         Ok(())
     }
@@ -1044,6 +1205,7 @@ serde_json = "1.0"
                 force: false,
                 status: false,
                 cont: false,
+                abort: false,
                 path: Some("//third_party/dockyard".to_string()),
             },
             &paths,

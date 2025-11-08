@@ -73,6 +73,13 @@ struct UpdateCommandArgs {
         default_value_t = false
     )]
     cont: bool,
+    #[arg(
+        long = "abort",
+        help = " \
+        Abort current update.",
+        default_value_t = false
+    )]
+    abort: bool,
     #[arg(help = " \
         Update third party dependency under specified path. \
         The path must be provided in the canonical format: //third_party/dep_name")]
